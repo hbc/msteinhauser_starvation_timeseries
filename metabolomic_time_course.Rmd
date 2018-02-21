@@ -1,0 +1,430 @@
+---
+title: "Steinhauser - Starvation metabolomics time course analysis"
+author: "Lorena Pantano"
+date: "`r date()`"
+output: 
+  html_document:
+    code_folding: hide
+    highlight: pygments
+    number_sections: false
+    toc: true
+---
+
+Metabolomics time course analysis of starvation in humans. 
+
+Total of 11 samples, 9 of which finished the whole experiment.
+
+
+```{r opts}
+library(knitr)
+opts_chunk$set(
+    autodep = TRUE,
+    cache = TRUE,
+    cache.lazy = TRUE,
+    error = TRUE,
+    dev = c("png", "pdf", "svg"),
+    error = TRUE,
+    fig.height = 7,
+    fig.retina = 2,
+    fig.width = 7,
+    message = FALSE,
+    prompt = TRUE,
+    warning = FALSE)
+```
+
+
+```{r load, cache = FALSE}
+library(dplyr)
+library(tibble)
+library(tidyr)
+library(readr)
+library(ggplot2)
+library(DEGreport)
+library(pheatmap)
+library(limma)
+library(SummarizedExperiment)
+library(cowplot)
+library(rio)
+theme_set(theme_light(base_size = 11))
+```
+
+```{r data}
+dat <- read_csv("2017_FastingStudy_Metabolites_Covariates deidentified_upload.csv")
+meta <- dat[, 1:47] %>% as.data.frame
+temp <- dat[,48:ncol(dat)]
+counts <- t(temp[,colSums(is.na(temp))<90])
+colnames(counts) <- paste(gsub("-","_",dat$Timepoint), dat$Subject, sep = "_")
+# counts[is.na(counts)] <- quantile(counts, 0.1, na.rm = T)
+counts[is.na(counts)] <- 0
+keep = !grepl("NH4$", rownames(counts))
+counts = counts[keep,]
+rownames(meta) <- colnames(counts)
+meta$Subject = factor(meta$Subject)
+meta$Timepoint = factor(gsub("-","_",meta$Timepoint), levels=c("Pre_Baseline", "Baseline", 
+                                                 "Fast_D1", "Fast_D2", "Fast_D3",
+                                                 "Fast_D5", "Fast_D7", "Fast_D9",
+                                                 "Fast_D10", "Re_Fd_D1"))
+meta$Description = paste0(meta$Subject, meta$Timepoint)
+```
+
+# QC figures
+
+## metadata missing values
+
+```{r metadata-missing, fig.height=11, fig.width=9}
+pheatmap(is.na(meta)*1, annotation_row = meta[,c("Subject", "Timepoint")])
+```
+
+## Metabolites missing values
+
+```{r na-counts}
+ma = counts[rowSums(counts==0)>0,]
+pheatmap::pheatmap((ma==0)*1, show_rownames = FALSE, annotation_col = meta[,c("Timepoint", "Gender")])
+```
+
+There are metabolites that are not detected almost all the time.
+We filter by group (Timepoint), needing at least 60% of the samples with some value to keep the metabolite.
+
+```{r filtering}
+ma = degFilter(counts, meta, "Timepoint", min = 0.6, minreads = 1)
+pheatmap::pheatmap((ma==0)*1, show_rownames = FALSE, annotation_col = meta[,c("Timepoint", "Gender")])
+```
+
+
+## Density abundance plot
+
+```{r density}
+reshape::melt(ma) %>% ggplot(aes(x=value, group=X2)) + geom_density() + scale_x_log10()
+```
+
+We replace missing values by the percentile 1 of the distribution to avoid outliers.
+
+```{r log2}
+ma[ma==0] <- quantile(ma, 0.1, na.rm = T)
+malog = normalizeBetweenArrays(log2(ma + 1), method = "none")
+```
+
+## PCA 
+
+```{r pca}
+cc <- scales::seq_gradient_pal("grey", "orange", "Lab")(seq(0,1,length.out=12))
+degPCA(malog, meta, condition = "Timepoint", name="Subject") + scale_color_manual(values = cc)
+```
+
+Remove Subject 8 - Baseline
+
+```{r remove-subject8}
+malog = malog[,colnames(malog)!="Baseline_8"]
+meta = meta[rownames(meta)!="Baseline_8",]
+save(malog, meta, file = "data/malog.rda")
+```
+
+```{r pca-clean}
+degPCA(malog, meta, condition = "Timepoint", name="Subject") + scale_color_manual(values = cc)
+```
+
+## PCA for each time {.tabset}
+
+```{r pca-time, fig.height=5, fig.width=5, results='asis'}
+for (t in unique(meta$Timepoint)){
+    cat("\n\n###", t, "\n")
+    c = ma[,grepl(t, colnames(counts))]
+    m = meta[grepl(t, rownames(meta)),]
+    p = DEGreport::degPCA(c, m,condition = "Subject", shape="Gender") + scale_color_manual(values = cc)
+    print(p + ggtitle(t))
+}
+```
+
+## PCA for each Subject {.tabset}
+
+```{r pca-subject, fig.height=5, fig.width=5, results='asis'}
+for (t in unique(meta$Subject)){
+    cat("\n\n###", t, "\n")
+    m = meta[meta$Subject==t,]
+    c = ma[,rownames(m)]
+    p = DEGreport::degPCA(c, m,condition = "Timepoint", shape="Gender") + scale_color_manual(values = cc)
+    print(p + ggtitle(t))
+}
+```
+
+## PCA vs metadata
+
+We correlate the PC loading values with the covariates and plot the ones
+that show a significant correlation.
+
+```{r meta-pca}
+new_meta = meta[,colSums(is.na(meta)) < 40]
+new_meta[is.na(new_meta)] = 0 
+colnames(new_meta) = make.names(colnames(new_meta))
+cov = degCovariates(malog, new_meta, correlation = "kendall")
+```
+
+Checking correlation of metadata variables with PCA loadings:
+
+```{r support}
+plot_grid(
+    cbind(cov$pcsMatrix, new_meta) %>% ggplot(aes(x=`PC1`, y=`Weight.loss..kg.`)) + geom_point(),
+    cbind(cov$pcsMatrix, new_meta) %>% ggplot(aes(x=`PC1`, y=`NEFA`)) + geom_point(),
+cbind(cov$pcsMatrix, new_meta) %>% ggplot(aes(x=`PC1`, y=`Ketones`)) + geom_point()
+)
+
+```
+
+It seems Weight loss and NEFA has a good correlation with the PC1. We'll take this into account in the future to specifically determine what metabolites change due to these covariates.
+
+# Differentially expression analysis
+
+## Over time
+
+First we'll look at the metabolites that change over time. We consider the Subject as a covariate in the analysis to capture more variation. 
+We'll get any gene that changes between any Timepoint and the Baseline.
+
+The first plot shows that abundance and variance are related, so we take this into account.
+
+```{r limma, fig.height=5, fig.width=5, results='asis'}
+library(limma)
+model <- model.matrix(data=meta, ~ Subject + Timepoint)
+v = vooma(malog, design = model, plot = T)
+fit <- lmFit(v,model)
+
+# Get all time vs time genes
+cntrst <- makeContrasts("TimepointFast_D1-TimepointBaseline", 
+                        "TimepointFast_D2-TimepointBaseline", 
+                        "TimepointFast_D3-TimepointBaseline", 
+                        "TimepointFast_D5-TimepointBaseline", 
+                        "TimepointFast_D7-TimepointBaseline", 
+                        "TimepointFast_D9-TimepointBaseline", 
+                        "TimepointFast_D10-TimepointBaseline", 
+                        "TimepointRe_Fd_D1-TimepointBaseline", 
+                        levels=model)
+fit2 <- contrasts.fit(fit, cntrst)
+fit2 <- eBayes(fit2,trend=TRUE, robust=TRUE)
+
+
+# joining contrast
+res = lapply(colnames(fit2), function(c){
+ df = toptable(fit2, coef=c, number = Inf, sort.by = "none") %>%
+    select(logFC, adj.P.Val)
+ prefix = gsub("Timepoint", "", c)
+ colnames(df) = paste(prefix, colnames(df), sep="_")
+ df
+}) %>% bind_cols()
+res[,"id"] = rownames(malog)
+#adding max_FC
+res[,"maxFC"] = apply(abs(res[,grepl("FC", colnames(res))]), 1, max)
+
+sign <- rowSums(decideTests(fit2, lfc = 0.5, p.value = 0.05)!=0)>0
+
+cat("\n\nNumber of DE-metabolites in each comparison with abs(logFC>0.5)\n\n")
+kable(colSums(decideTests(fit2, lfc = 0.5)!=0))
+
+```
+
+
+
+In total, there are `r sum(sign)` DE-metabolites with abs(logFC)>0.5
+
+Let's plot some genes to confirm the analysis
+
+```{r plot-genes}
+degPlotWide(counts = malog, genes = names(sign[sign])[1:5], 
+            group = "Timepoint", metadata = meta, )
+```
+
+### Clustering genes
+
+We grouped genes together. Basically, we calculate all pair correlations, cluster and try to define groups of metabolites.
+
+The plots show the scaled abundance of the metabolites. Eact timepoint
+represents a point, and is the average expression of all the subject
+in that time point. 
+
+```{r pattern, fig.height=9}
+respattern <- degPatterns(v$E[sign,], meta, summarize = "Timepoint",
+                          time="Timepoint",concensusCluster = FALSE,
+                          col=NULL, minc = 5)
+
+```
+
+
+Be aware, that scaled version always exagerate the difference, when looking
+to the numbers directly the difference could be small, but the pattern
+should be similar.
+
+
+```{r, eval=FALSE, echo=FALSE}
+exp = v$E[sign,]
+de = meta
+counts_group = t(sapply(rownames(exp), function(g){
+    sapply(levels(de[,"Timepoint"]), function(i){
+        idx = which(de[,"Timepoint"] == i)
+        mean(exp[g, idx], na.rm=TRUE)
+    })
+}))
+colnames(counts_group) = unique(de[,"Timepoint"])
+
+library(cluster)
+m = (1-cor(t(counts_group), method = "kendall"))
+d = as.dist(m^2)
+c = diana(d, diss = TRUE, stand = FALSE)
+
+plot(as.dendrogram(c))
+c$dc
+g=cutree(as.hclust(c), h = c$dc)
+table(cutree(as.hclust(c), h = c$dc))
+
+genes = respattern$df$genes[respattern$df$cluster==4]
+counts_group[as.character(genes[1:9]),] %>% melt %>%
+    mutate(X2=factor(X2, levels=levels(meta$Timepoint))) %>%
+    ggplot(aes(x=X2, y=value, group=X1)) + geom_line() +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+```
+
+```{r plot-some-genes, eval=FALSE, echo=FALSE}
+se = SummarizedExperiment(assays = SimpleList(counts=malog), colData=meta)
+
+for (c in respattern$pass){
+    genes = respattern$df$genes[respattern$df$cluster==c]
+    p <- degPlot(dds=se, genes = genes[1:9], xs = "Timepoint", group = "Gender") + facet_wrap(~gene, scales = "free_y") + theme(axis.text.x = element_text(angle = 90, hjust = 1)) + ggtitle(paste("Cluster", c))
+    print(p)
+}
+
+```
+
+
+The file `timepoint_de.xls` contains all the logFC and p.adj.value for each
+comparison as well as the number of cluster where the gene has been assigned.
+
+
+```{r clean-patterns}
+profile <- lapply(unique(respattern$df$cluster), function(c){
+    .genes <- as.character(respattern$df$genes[respattern$df$cluster==c])
+    meds = colMedians(respattern$profile[.genes,])
+    
+    lapply(.genes, function(g){
+        .cor = cor.test(respattern$profile[g,], meds)
+        data.frame(gene=g, pval=.cor$p.value, rho=.cor$estimate, cluster=c)
+    }) %>% bind_rows()
+    
+}) %>% bind_rows()
+
+good_clusters = profile %>% 
+    mutate(fdr=p.adjust(pval, method="fdr")) %>%
+    filter(fdr<0.01, rho>0.7)
+
+profile %>% mutate(fdr=p.adjust(pval, method="fdr")) %>%
+    right_join(res, by=c("gene"="id")) %>% 
+    export("clean_timepoint_de.xls", "tsv")
+
+```
+
+```{r meta-patterns, results='asis'}
+cor_meta <- lapply(unique(respattern$df$cluster), function(c){
+    .genes <- as.character(respattern$df$genes[respattern$df$cluster==c])
+    meds = colMedians(v$E[.genes,])
+    lapply(colnames(meta), function(m){
+        .meta_noempty = as.numeric(as.factor(meta[!is.na(meta[,m]),m]))
+        .cor = cor.test(.meta_noempty, meds[!is.na(meta[,m])])
+        data.frame(covar=m, pval=.cor$p.value, rho=.cor$estimate, cluster=c)
+    }) %>% bind_rows()
+    
+}) %>% bind_rows()
+
+cor_meta %>% 
+    mutate(fdr=p.adjust(pval, method="fdr")) %>%
+    filter(fdr<0.01, abs(rho)>0.6) %>% 
+    DT::datatable()
+
+cor_meta %>% mutate(fdr=p.adjust(pval, method="fdr")) %>% 
+    export("clean_cor_meta.xls", "tsv")
+```
+
+## Covariates
+
+Here we get the metabolites that correlates
+with the covariates that we had detected previously to be important.
+
+I'll do just weight loss named as `loss`, `NEFA` and `Ketones`. I am still
+adding Subject and Timepoint, to only get metabolites that are more correlated to the covariates than Subject of Timepoint. For instance, weight loss maybe correlated to timepoint, and maybe we don't get any significant metabolite.
+
+As well, I am using only people who has data for the covariate.
+
+```{r covars}
+meta_w = meta[!is.na(meta$`Weight loss (kg)`),]
+meta_w$loss = meta_w[,"Weight loss (kg)"]
+ma_w = malog[,rownames(meta_w)]
+model <- model.matrix(data=meta_w, ~ Subject + Timepoint + loss)
+v = vooma(ma_w, design = model)
+fit <- lmFit(v,model)
+fit <- eBayes(fit, robust=TRUE)
+w_res = topTable(fit, coef = "loss", n=Inf) %>% 
+    rownames_to_column("id") %>%
+    select(id, loss_lfc=logFC, loss_adj.P.Val=adj.P.Val)
+
+meta_nefa = meta[!is.na(meta$NEFA),]
+ma_nefa = malog[,rownames(meta_nefa)]
+model <- model.matrix(data=meta_nefa, ~ Subject + Timepoint + NEFA)
+v = vooma(ma_nefa, design = model)
+fit <- lmFit(v,model)
+fit <- eBayes(fit, robust=TRUE)
+nefa_res = topTable(fit, coef = "NEFA", n=Inf) %>% 
+    rownames_to_column("id") %>%
+    select(id, nefa_lfc=logFC, nefa_adj.P.Val=adj.P.Val)
+
+meta_keto = meta[!is.na(meta$Ketones),]
+ma_keto = malog[,rownames(meta_keto)]
+model <- model.matrix(data=meta_keto, ~ Subject + Timepoint + Ketones)
+v = vooma(ma_keto, design = model)
+fit <- lmFit(v,model)
+fit <- eBayes(fit, robust=TRUE)
+keto_res = topTable(fit, coef = "Ketones", n=Inf)  %>% 
+    rownames_to_column("id") %>%
+    select(id, keto_lfc=logFC, keto_adj.P.Val=adj.P.Val)
+
+full = res %>% full_join(w_res, by="id") %>% 
+    full_join(nefa_res) %>% full_join(keto_res)
+export(full, "clean_full_cov_de.xls", "tsv")
+```
+
+Number of differentially expressed due to the covariate (abs logFC>0.5, FDR<0.05):
+
+```{r sum-covars, results='asis', cache = FALSE}
+rbind(
+w_res %>% filter(abs(loss_lfc>0.3), loss_adj.P.Val<0.05) %>% count_(),
+nefa_res %>% filter(abs(nefa_lfc>0.5), nefa_adj.P.Val<0.05) %>% count_(),
+keto_res %>% filter(abs(keto_lfc>0.5), keto_adj.P.Val<0.05) %>% count_()) %>%
+    mutate(type=c("weight loss", "NEFA", "Ketonas")) %>% kable
+```
+
+
+Full table with this information can be found at `full_cov_de.xls`
+
+```{r upload, echo=FALSE, eval=FALSE}
+library(rdrop2)
+token <- readRDS("~/.droptoken.rds")
+# Then pass the token to each drop_ function
+# d = drop_acc(dtoken = token)
+dropdir = "HBC Team Folder (1)/Consults/matthew_steinhauser/starvation_metabolimics_time_course_analysis"
+drop_upload("clean_cor_meta.xls", path=dropdir)
+drop_upload("clean_cor_meta_13vars.xls", path=dropdir)
+drop_upload("clean_timepoint_de.xls", path=dropdir)
+drop_upload("clean_full_cov_de.xls", path=dropdir)
+drop_upload("clean_metabolomic_time_course.html", path=dropdir)
+for (fn in list.files("metabolomic_time_course_files/figure-html", full.names = T)) {
+    drop_upload(fn, path=file.path(dropdir, dirname(fn)))
+}
+
+drop_upload("methods.docx", path=dropdir)
+drop_upload("clean_cor_meta_13vars.xls", path=dropdir)
+for (fn in list.files("figures", full.names = T)) {
+    drop_upload(fn, path=file.path(dropdir, dirname(fn)))
+}
+```
+
+# R session Info
+
+```{r session}
+sessionInfo()
+```
+
